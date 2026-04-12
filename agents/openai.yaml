@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jamovi Analysis"
+  short_description: "Help with jamovi-native stats workflows and saved .omv projects"
+  default_prompt: "Run jamovi-native statistical workflows with the local jamovi installation, preferring project mode when the user wants a real .omv file."
