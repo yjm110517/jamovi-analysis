@@ -308,9 +308,9 @@ flowchart TB
     subgraph Engine["jamovi 内部引擎"]
         SES[Session]
         INST[Instance]
-        DATA[数据集加载<br/>open()]
-        ANA[分析执行<br/>create() + poll()]
-        SAVE[工程保存<br/>save() -> .omv]
+        DATA["数据集加载<br/>open()"]
+        ANA["分析执行<br/>create() + poll()"]
+        SAVE["工程保存<br/>save() -> .omv"]
     end
 
     subgraph Output["输出层"]
