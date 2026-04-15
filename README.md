@@ -12,16 +12,42 @@ Jamovi Analysis is an automation and integration layer designed to run programma
 jamovi-analysis/
 ├── agents/
 │   └── openai.yaml          # OpenAI agent interface configuration
+├── assets/
+│   └── apa-template.docx    # DOCX report template for APA output
+├── examples/                # Runnable sample datasets + expected outputs
+│   ├── cross_sectional_survey/
+│   ├── prepost_scale_study/
+│   ├── regression_study/
+│   ├── reliability_study/
+│   └── ttest_study/
 ├── references/
 │   ├── analysis-map.md      # jmv function mapping & project-mode scope
+│   ├── development-plan.md  # Development roadmap and completed phases
 │   ├── install-layout.md    # Verified local jamovi installation paths
-│   └── project-mode.md      # JobFile schema, measurement rules & lifecycle
+│   ├── output-templates.md  # Canonical extractor output keys & contracts
+│   ├── project-mode.md      # JobFile schema, measurement rules & lifecycle
+│   └── reporting-templates.md # APA 7th edition table templates
 ├── scripts/
 │   ├── find-jamovi.ps1              # Auto-discovers jamovi install root
 │   ├── invoke-jamovi-project.ps1    # Main entrypoint: generates .omv + Markdown report
 │   ├── invoke-jamovi-r.ps1          # Batch R statistics via jamovi's bundled Rscript
+│   ├── preflight-jamovi-project.ps1 # Capability check before real analyses
 │   ├── run-jamovi-project.py        # Core Python runner (do not invoke directly)
 │   └── start-jamovi-server.ps1      # Starts interactive jamovi.server process
+├── src/jamovi_runner/       # Core Python package
+│   ├── extract/             # Result extractors for 9 jamovi analyses
+│   ├── reporters/           # Markdown/DOCX/HTML/PDF/LaTeX report generators
+│   ├── formatting.py        # APA number/formatting utilities
+│   ├── preprocess.py        # Data cleaning, aliasing, reverse scoring
+│   ├── report.py            # Markdown report builder (GFM & APA 7th)
+│   └── schema.py            # JobFile validation schema
+├── templates/
+│   ├── input/               # Starter CSV templates for 5 study types
+│   └── output/              # Canonical APA markdown table templates
+├── tests/                   # pytest suite (109 tests)
+├── vendor/
+│   └── jamovi-python/       # Vendored python-docx, markdown, lxml
+├── pytest.ini               # Test configuration
 ├── SKILL.md                 # AI agent skill manifest
 ├── README.md                # This file (English)
 └── README_zh.md             # Chinese README
@@ -77,6 +103,16 @@ For standard educational/psychology surveys, use `request_kind: "preset"` to aut
   - `descriptives` (pre/post/delta subscales, split by group/cluster when provided)
   - `ttestPS` (paired pre vs post for each subscale)
   - `ttestIS` (delta by group when group_column is provided)
+
+### APA 7th Edition Reporting
+
+Set `output.table_style: "apa"` to generate publication-ready tables with:
+- Automatic table numbering (*Table 1*, *Table 2*)
+- Italicized statistical symbols (*M*, *SD*, *t*, *p*, *F*, *β*, *η²p*)
+- Proper decimal formatting and leading-zero rules
+- DOCX export with APA borders via `python-docx`
+
+See `templates/output/` for canonical APA table templates and `references/reporting-templates.md` for the full specification.
 
 ### Chinese Locale Support
 
@@ -378,6 +414,25 @@ Each run produces:
 
 ---
 
+## Development
+
+### Running Tests
+
+The project includes a comprehensive pytest suite:
+
+```bash
+python -m pytest tests/ -v
+```
+
+Key test modules:
+- `test_extract.py` — Result extractor correctness
+- `test_preprocess.py` — Data cleaning and template validation
+- `test_report.py` — APA table formatting
+- `test_template_regression.py` — Example directory structure and output matching
+- `test_integration.py` — Runner script structural checks
+
+---
+
 ## References
 
 | File | Purpose |
@@ -385,6 +440,8 @@ Each run produces:
 | [`references/install-layout.md`](references/install-layout.md) | Verified local jamovi paths (Python, R, modules) |
 | [`references/analysis-map.md`](references/analysis-map.md) | `jmv` function mapping and project-mode scope |
 | [`references/project-mode.md`](references/project-mode.md) | JobFile schema, measurement rules, lifecycle, timeout handling |
+| [`references/output-templates.md`](references/output-templates.md) | Canonical extractor output keys and effect-size derivation rules |
+| [`references/reporting-templates.md`](references/reporting-templates.md) | Full APA 7th edition table templates and symbol mappings |
 
 ---
 
