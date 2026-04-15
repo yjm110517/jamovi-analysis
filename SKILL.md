@@ -1,108 +1,182 @@
 ---
 name: jamovi-analysis
 description: Run jamovi-native statistical analyses with the local jamovi installation. Use when the user asks to analyze data with jamovi or jmv, wants jamovi-compatible descriptives, t-tests, ANOVA, regression, correlation, contingency tables, reliability workflows, or needs a real `.omv` project saved through jamovi internals.
+version: 1.0
 ---
 
 # Jamovi Analysis
 
-Use the mode that matches the requested output:
+**Primary Rule:** By default, always use **Project Mode** with a **JobFile** (JSON configuration). This ensures data preprocessing, stable execution, and generates a real `.omv` project file and Markdown summary.
 
-- Use project mode when the user wants a real jamovi project file, wants to preserve analyses in `.omv`, or wants a reusable Markdown summary with key statistics.
-- Use bundled R + `jmv` when the task only needs quick batch output in the terminal.
-- Use `jamovi.server` only when a live jamovi session or browser-backed behavior is explicitly needed.
+Only use R batch mode if the user explicitly asks for "quick terminal statistics without saving". Only use server mode if the user explicitly asks for "a live session".
+
+## When to Use
+
+Use this skill when the user requests any of the following:
+
+- **Statistical analyses via jamovi**: t-tests, ANOVA, regression, correlation, contingency tables, reliability (Cronbach's α), or descriptive statistics.
+- **Generating a `.omv` project file** programmatically from a dataset.
+- **APA 7th edition formatted reports** (Markdown or DOCX) from jamovi output.
+- **Preprocessing survey/scale data**: reverse scoring, subscale aggregation, column aliasing for non-English headers.
+
+Do **not** use this skill when the user:
+
+- Asks for a generic R script without mentioning jamovi (use plain R instead).
+- Wants interactive GUI instructions for the jamovi desktop app (this skill is automation/programmatic only).
+
+## Usage
+
+The canonical workflow is a two-step "call":
+
+1. **Generate a JobFile** (JSON config) based on the user's data and analysis needs.
+2. **Execute the PowerShell wrapper** with the `-JobFile` parameter.
+
+```powershell
+& '.\scripts\invoke-jamovi-project.ps1' -JobFile '.\temp\job.json'
+```
+
+Claude should perform both steps automatically: write the JSON file to a sensible location, then invoke the script.
 
 ## Quick Start
 
-1. Confirm the jamovi install root. In this environment, default to `C:\Program Files\jamovi 2.6.19.0`.
-2. For `.omv` output, use [scripts/invoke-jamovi-project.ps1](scripts/invoke-jamovi-project.ps1).
-3. For quick batch statistics, use [scripts/invoke-jamovi-r.ps1](scripts/invoke-jamovi-r.ps1).
-4. For interactive jamovi behavior, use [scripts/start-jamovi-server.ps1](scripts/start-jamovi-server.ps1).
-5. For project-mode schema, supported analyses, and measurement rules, read [references/project-mode.md](references/project-mode.md).
+1. The wrapper `scripts/invoke-jamovi-project.ps1` will automatically discover the jamovi install root.
+2. The recommended interface is to write a single JSON configuration (`JobFile`) and pass it via `-JobFile`.
+3. If the input data is a raw survey/instructional dataset (with Chinese headers, empty columns, duplicate names, or reverse scoring needs), **you MUST use the preprocess stage**. Do NOT manually clean the CSV via python scripts yourself—the runner does this for you automatically when invoked properly.
 
-## Preferred Workflow
+## Data Preparation & Templates
 
-### Project mode
+Before running any analysis, ensure the input data follows these rules:
 
-- This is the default path when the user asks for a jamovi project or `.omv` file.
-- The wrapper hard-pins jamovi's bundled interpreter: `C:\Program Files\jamovi 2.6.19.0\Frameworks\python\python.exe`.
-- It explicitly clears `PYTHONHOME`, `PYTHONPATH`, `VIRTUAL_ENV`, and inherited `CONDA_*` variables before launching the Python runner.
-- The runner uses jamovi internals (`Session -> Instance -> Analyses -> save()`) and writes:
-  - a timestamped `.omv`
-  - a same-stem `.md` summary
-- v1 is intentionally conservative:
-  - single event loop via `asyncio.run()`
-  - strictly serial analysis execution
-  - per-analysis polling with timeout
-  - explicit teardown
-  - fail-fast NL parsing
-  - no parallel analysis dispatch
+1. **Wide Format**: One row per participant, one column per variable.
+2. **Headers**: First row must be column names. Chinese headers are supported and will be aliased automatically.
+3. **Missing Values**: Leave cells empty, or use `NA`, `N/A`, `null`, `.`.
+4. **Scale Items**: Must be integers (e.g., 1–5 or 1–7). No decimal points.
+5. **Grouping Variables**: For independent-samples t-tests, exactly 2 levels; for ANOVA, 2 or more levels.
 
-### Bundled R batch mode
+### Ready-Made Templates
 
-- Use jamovi's bundled `Frameworks\R\bin\x64\Rscript.exe`.
-- Let the wrapper add `.libPaths()` for `Resources\modules\jmv\R` and `Resources\modules\base\R`.
-- Load `library(jmv)` and call exported functions such as `descriptives()`, `ttestIS()`, `anovaOneW()`, `linReg()`, or `corrMatrix()`.
-- Use this mode when the user only needs immediate results, not a persisted jamovi project.
+Use the CSV templates in `templates/input/` as a starting point:
 
-### Interactive jamovi session
+| Template | Use Case |
+|----------|----------|
+| `prepost_scale_study.csv` | Educational experiments with pre-test and post-test Likert scales |
+| `cross_sectional_survey.csv` | Single-timepoint questionnaire studies |
+| `ttest_two_group.csv` | Simple independent-samples t-test |
+| `reliability_scale.csv` | Cronbach's α and McDonald's ω analysis |
+| `regression_study.csv` | Linear or binary logistic regression |
 
-- Use the server wrapper only when the user needs a real jamovi session, browser-backed behavior, or GUI-like interaction.
-- Keep the server in the foreground unless there is a clear reason to background it.
-- Record the `ports:` line and the `access_key` value when the server starts.
+See `templates/input/README.md` for column naming conventions and constraints.
 
-## Wrapper Scripts
+### Working Examples
 
-### `scripts/invoke-jamovi-project.ps1`
-
-- This is the only supported entrypoint for project mode.
-- It must launch the runner with jamovi's bundled Python, never with system Python.
-- It accepts:
-  - structured mode: `-DataPath` plus `-SpecJson` or `-SpecFile`
-  - NL mode: `-DataPath` plus `-Request`
-  - optional: `-OutputDir`, `-OutputBasename`, `-AnalysisTimeoutSeconds`, `-PollIntervalMs`
-
-Structured example:
+The `examples/` directory contains runnable sample datasets and expected APA outputs:
 
 ```powershell
-& 'C:\Users\WINDOWS\.codex\skills\jamovi-analysis\scripts\invoke-jamovi-project.ps1' `
-  -DataPath 'C:\data\study.csv' `
-  -SpecJson '{"analyses":[{"analysis_type":"ttestIS","variables":{"vars":["score"],"group":"group"}}]}'
+& 'scripts/invoke-jamovi-project.ps1' -JobFile 'examples/ttest_study/jobfile.json'
 ```
 
-Natural-language example:
+Each example includes:
+- `data.csv` — sample dataset
+- `jobfile.json` — ready-to-run JobFile
+- `expected-output.md` — expected APA 7th edition report format
+
+## The Canonical Request (JobFile)
+
+You should create a JSON file (e.g., `request.json` in a temp dir) and pass its path to `invoke-jamovi-project.ps1 -JobFile temp\request.json`.
+
+### Preset Mode (Highly Recommended for Surveys/Assessments)
+
+For educational data, pre/post tests, and rating scales, use the `preset` mode. The runner will automatically:
+1. Clean headers and create stable ASCII aliases (`column_manifest.json`).
+2. Deduplicate empty columns.
+3. Compute reverse-scored items (using `max_scale`).
+4. Calculate subscale mean scores.
+5. Automatically run a preset suite of analyses:
+   - `descriptives` (pre/post/delta subscales, split by group/cluster when provided)
+   - `ttestPS` (paired pre vs post for each subscale)
+   - `ttestIS` (delta by group, if group column is provided)
+
+```json
+{
+  "data_path": "C:/data/raw_study.xlsx",
+  "mode": "project",
+  "sheet": "Sheet1",
+  "locale": "zh",
+  "request_kind": "preset",
+  "preset": {
+    "name": "prepost_scale_study",
+    "id_column": "user_id",
+    "group_column": "class_group",
+    "cluster_column": "cluster_type",
+    "pre_prefix": "pre_",
+    "post_prefix": "post_",
+    "max_scale": 5,
+    "reverse_items": ["q24", "q25", "q26"],
+    "subscales": {
+      "creativity": ["q01", "q02", "q03"],
+      "algorithmic": ["q09", "q10", "q11"]
+    }
+  },
+  "output": {
+    "dir": "C:/data/jamovi_outputs",
+    "basename": "ct-core-analysis",
+    "table_style": "apa"
+  }
+}
+```
+
+> **Note**: `locale` defaults to `"zh"` (Chinese). Set to `"en"` for English .omv labels. The `reverse_items` and `subscales` items can use either alias keys (e.g. `q24`) or original header text.
+
+### Structured Mode
+
+If you need a specific set of tests rather than a full survey preset, use `request_kind: "structured"`. The runner will still perform standard data cleaning (ASCII aliasing) before running your specified analyses.
+
+```json
+{
+  "data_path": "C:/data/study.csv",
+  "mode": "project",
+  "request_kind": "structured",
+  "analyses": [
+    {
+      "analysis_type": "descriptives",
+      "variables": {
+        "vars": ["score", "age"],
+        "splitBy": ["group"]
+      }
+    },
+    {
+      "analysis_type": "ttestIS",
+      "variables": {
+        "vars": ["score", "time"],
+        "group": "group"
+      },
+      "options": {
+        "students": true,
+        "effectSize": true,
+        "ci": true,
+        "desc": true
+      }
+    }
+  ],
+  "output": {
+    "dir": "C:/data/jamovi_outputs",
+    "basename": "study-report",
+    "table_style": "apa"
+  }
+}
+```
+
+### Script Execution
 
 ```powershell
-& 'C:\Users\WINDOWS\.codex\skills\jamovi-analysis\scripts\invoke-jamovi-project.ps1' `
-  -DataPath 'C:\data\study.csv' `
-  -Request 'Run descriptives for score and age'
+& '.\scripts\invoke-jamovi-project.ps1' -JobFile '.\temp\job.json'
 ```
 
-### `scripts/invoke-jamovi-r.ps1`
-
-- Use `-Code` for short inline R.
-- Use `-File` when the R code is long or reusable.
-- Pass `-JamoviHome` only when the install is not `C:\Program Files\jamovi 2.6.19.0`.
-
-### `scripts/start-jamovi-server.ps1`
-
-- Use to start `python -m jamovi.server` with the environment variables jamovi expects.
-- Default to port `0` so jamovi chooses a free port.
-- Add `-ExposeAllInterfaces` only when a remote connection is explicitly required.
-
-## Project Mode Rules
-
-- The runner must be launched only through the PowerShell wrapper.
-- The runner uses a single event loop and explicit teardown to reduce zombie R processes and engine cleanup issues on Windows.
-- If an analysis times out, it is marked failed, recorded in Markdown, and the runner attempts engine restart before continuing.
-- If a column's measure type is wrong for the requested analysis, the runner corrects it before creating the analysis when that correction is safe.
-- If a safe correction is not possible, the analysis fails fast before `analyses.create(...)`.
-
-## Supported Project-Mode Analyses
-
-v1 project mode currently implements these high-frequency analyses:
+## Supported Analyses
 
 - `descriptives`
-- `ttestIS`
+- `ttestIS` (Independent groups t-test)
+- `ttestPS` (Paired samples t-test)
 - `anovaOneW`
 - `corrMatrix`
 - `linReg`
@@ -110,50 +184,59 @@ v1 project mode currently implements these high-frequency analyses:
 - `contTables`
 - `reliability`
 
-Project mode v1 does not implement PCA, EFA, or CFA.
+## Report Formats
 
-## Natural-Language Mode
+The output Markdown report supports two `table_style` modes:
 
-- NL mode is deterministic and fail-fast.
-- The parser returns a strict JSON contract:
-  - `is_executable`
-  - `missing_info`
-  - `analysis_spec`
-- If the request is missing roles or remains ambiguous, the runner returns a parse error instead of guessing.
-- The runner strips Markdown fences such as ````json ... ````
-  before attempting `json.loads()`.
-- NL mode is deliberately narrow. Use exact column names and explicit phrasing such as:
-  - `Run descriptives for score and age`
-  - `Run a correlation for score and age`
-  - `Run an independent samples t-test for score by group`
-  - `Run one-way ANOVA for score by condition`
-  - `Predict outcome from age and score`
+- `gfm` — General GitHub-flavored Markdown. Flexible, machine-readable.
+- `apa` — Strict APA 7th edition formatting for education/psychology manuscripts.
 
-## Reporting Rules
+### APA 7th Edition Output Examples
 
-- State the analysis name and variables used.
-- State non-default options that materially affect interpretation.
-- For project mode, prefer the Markdown summary when the user wants a dehydrated report.
-- The Markdown summary should include key statistics when extractable:
-  - t-tests: statistic, df, p, effect size
-  - one-way ANOVA: F, df1, df2, p
-  - correlations: r, p, N
-  - linear regression: R2 and coefficient table
-  - logistic regression: model fit and coefficient table with odds ratios
-  - contingency tables: chi-square, df, p, nominal measures
-  - reliability: Cronbach alpha and omega
-  - descriptives: N, mean, median, SD, min, max
+When `table_style` is set to `"apa"`, the report follows these conventions:
+- **Decimals**: Two decimal places for means, SDs, t, F, b, β.
+- **Statistical symbols**: Italicized: *M*, *SD*, *t*, *p*, *r*, *F*, *β*, *b*, *η*, *ω*.
+- **Leading zeros**: Omitted for correlations and p-values (e.g., `r = .45`, `p = .021`). Kept for other statistics (e.g., `M = 3.45`).
+- **Tables**: Numbered consecutively (Table 1, Table 2...), titles italicized.
+
+#### Descriptive Statistics Example
+
+```markdown
+Table 1
+*Descriptive Statistics for Study Variables (N = 120)*
+
+| Variable | *M* | *SD* | Min | Max |
+|----------|-----|------|-----|-----|
+| Creativity | 3.82 | 0.71 | 1.00 | 5.00 |
+| Algorithmic Thinking | 3.45 | 0.89 | 1.00 | 5.00 |
+
+Note. Scores range from 1 to 5.
+```
+
+#### Independent Samples t-Test Example
+
+```markdown
+Table 2
+*Independent Samples t-Test for Test Scores by Group*
+
+| Variable | Group 1 | Group 2 | *t* | *df* | *p* | Cohen's *d* | 95% CI |
+|----------|---------|---------|-----|------|-----|-------------|--------|
+| | *M* (*SD*) | *M* (*SD*) | | | | | |
+| Test Score | 80.00 (15.00) | 85.00 (10.00) | 2.17 | 49 | .021 | 0.53 | [0.10, 1.05] |
+```
+
+> The experimental group (*M* = 85.00, *SD* = 10.00) scored significantly higher than the control group (*M* = 80.00, *SD* = 15.00), *t*(49) = 2.17, *p* = .021, *d* = 0.53.
+
+For the complete APA specification, see `references/reporting-templates.md`.
+
+## Legacy Wrapper Scripts & Modes
+
+- `scripts/invoke-jamovi-project.ps1`: Accepts legacy flags (`-DataPath`, `-SpecJson`, `-Request`). These bypass the new JobFile canonical flow but are maintained for backward compatibility.
+- `scripts/invoke-jamovi-r.ps1`: Run bundled R batch scripts.
+- `scripts/start-jamovi-server.ps1`: Start an interactive browser jamovi backend.
 
 ## References
 
-- Read [references/install-layout.md](references/install-layout.md) for verified local jamovi paths.
-- Read [references/analysis-map.md](references/analysis-map.md) for common `jmv` function mappings and project-mode scope.
 - Read [references/project-mode.md](references/project-mode.md) for the structured spec schema, measurement rules, lifecycle, and validation expectations.
-
-## Validation
-
-- After editing project mode, run a real smoke test through `invoke-jamovi-project.ps1`.
-- Validate the generated `.omv` with `zipfile` instead of jamovi GUI:
-  - confirm `metadata.json` exists
-  - confirm at least one analysis archive entry exists
-- Treat jamovi YAML files as authoritative when your memory and the YAML disagree.
+- Read [references/analysis-map.md](references/analysis-map.md) for common `jmv` function mappings and project-mode scope.
+- Read [references/reporting-templates.md](references/reporting-templates.md) for the full APA 7th edition table templates and extractor contracts.

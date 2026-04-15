@@ -10,6 +10,8 @@ These are implemented in `.omv` project mode:
   - YAML: `descriptives.a.yaml`
 - Independent groups t-test: `ttestIS`
   - YAML: `ttestis.a.yaml`
+- Paired samples t-test: `ttestPS`
+  - YAML: `ttestps.a.yaml`
 - One-way ANOVA: `anovaOneW`
   - YAML: `anovaonew.a.yaml`
 - Correlation matrix: `corrMatrix`
@@ -27,8 +29,6 @@ These are implemented in `.omv` project mode:
 
 These remain batch-mode references in v1 and are not implemented in project mode:
 
-- Paired samples t-test: `ttestPS`
-  - YAML: `ttestps.a.yaml`
 - One-sample t-test: `ttestOneS`
   - YAML: `ttestones.a.yaml`
 - Factorial ANOVA: `ANOVA`

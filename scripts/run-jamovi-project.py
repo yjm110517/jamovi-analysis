@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import html
+import importlib
 import json
 import os
 import re
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,10 +18,39 @@ from typing import Any, Iterable, Sequence
 
 
 DEFAULT_JAMOVI_HOME = Path(os.environ.get("JAMOVI_HOME", r"C:\Program Files\jamovi 2.6.19.0"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_ROOT = DEFAULT_JAMOVI_HOME / "Resources" / "server"
+DEFAULT_VENDOR_ROOT = PROJECT_ROOT / "vendor" / "jamovi-python"
 
 if str(SERVER_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVER_ROOT))
+
+
+def configure_vendor_paths() -> list[str]:
+    raw_value = os.environ.get("JAMOVI_PROJECT_VENDOR_PATH")
+    candidates: list[str] = []
+    if raw_value:
+        candidates.extend(entry.strip() for entry in raw_value.split(os.pathsep) if entry.strip())
+    elif DEFAULT_VENDOR_ROOT.exists():
+        candidates.append(str(DEFAULT_VENDOR_ROOT))
+
+    configured: list[str] = []
+    for entry in candidates:
+        resolved = str(Path(entry).resolve())
+        if not Path(resolved).exists():
+            continue
+        if resolved not in sys.path:
+            sys.path.insert(0, resolved)
+        configured.append(resolved)
+    return configured
+
+
+VENDOR_PATHS = configure_vendor_paths()
+
+# Allow importing the refactored jamovi_runner package
+SRC_ROOT = str(PROJECT_ROOT / "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
 
 if os.environ.get("JAMOVI_PROJECT_RUNNER") != "1":
     raise SystemExit("run-jamovi-project.py must be launched via invoke-jamovi-project.ps1")
@@ -27,6 +59,18 @@ from jamovi.core import DataType, MeasureType  # noqa: E402
 from jamovi.server.analyses.analysis import Analysis  # noqa: E402
 from jamovi.server.options import Options  # noqa: E402
 from jamovi.server.session import Session  # noqa: E402
+
+from jamovi_runner.extract import build_summary_sections  # noqa: E402
+from jamovi_runner.formatting import format_number, format_p_value, markdown_table, render_markdown_table_block  # noqa: E402
+from jamovi_runner.preprocess import preprocess_data, PreprocessError  # noqa: E402
+from jamovi_runner.report import build_markdown_report as _build_markdown_report_from_package  # noqa: E402
+from jamovi_runner.reporters import (
+    build_docx_report,
+    build_runner_markdown_report,
+    export_report_formats,
+    render_markdown_html,
+    resolve_output_paths,
+)  # noqa: E402
 
 
 class RunnerError(Exception):
@@ -114,6 +158,13 @@ SUPPORTED_ANALYSES: dict[str, dict[str, Any]] = {
             "group": RoleSpec("variable", measure="categorical", required=True, min_levels=2),
         },
     },
+    "ttestPS": {
+        "title": "Paired Samples T-Test",
+        "namespace": "jmv",
+        "roles": {
+            "pairs": RoleSpec("variables", measure="continuous", required=True, min_items=2),
+        },
+    },
     "corrMatrix": {
         "title": "Correlation Matrix",
         "namespace": "jmv",
@@ -163,6 +214,7 @@ SUPPORTED_ANALYSES: dict[str, dict[str, Any]] = {
 DEFAULT_OPTION_OVERRIDES = {
     "descriptives": {"n": True, "missing": True, "mean": True, "median": True, "sd": True, "min": True, "max": True},
     "ttestIS": {"students": True, "welchs": True, "effectSize": True, "ci": True, "desc": True},
+    "ttestPS": {"students": True, "effectSize": True, "ci": True, "desc": True},
     "anovaOneW": {"welchs": True, "fishers": True, "desc": True},
     "corrMatrix": {"pearson": True, "sig": True, "n": True},
     "linReg": {"r": True, "r2": True, "r2Adj": True, "modelTest": True, "ci": True},
@@ -181,11 +233,14 @@ MEASURE_ALIASES = {
 
 NUMERIC_DATA_TYPES = {DataType.INTEGER, DataType.DECIMAL}
 BOUNDARY = r"(?<![0-9A-Za-z_]){pattern}(?![0-9A-Za-z_])"
+DEFAULT_TABLE_STYLE = "gfm"
+DEFAULT_EXPORT_FORMATS = ("pdf", "html", "latex")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run jamovi project-mode analyses and save .omv output.")
-    parser.add_argument("--data-path", required=True)
+    parser.add_argument("--data-path")
+    parser.add_argument("--job-file")
     parser.add_argument("--spec-json")
     parser.add_argument("--spec-file")
     parser.add_argument("--request")
@@ -194,6 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-basename")
     parser.add_argument("--analysis-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--poll-interval-ms", type=int, default=250)
+    parser.add_argument("--preflight", action="store_true")
     return parser.parse_args()
 
 
@@ -248,6 +304,155 @@ def ensure_mapping(value: Any, field_name: str) -> dict[str, Any]:
     return dict(value)
 
 
+def normalize_table_style(raw_value: Any) -> str:
+    if raw_value is None:
+        return DEFAULT_TABLE_STYLE
+    if not isinstance(raw_value, str):
+        raise SpecError("output.table_style must be a string")
+    normalized = raw_value.strip().casefold()
+    if normalized not in {"gfm", "apa"}:
+        raise SpecError("output.table_style must be 'gfm' or 'apa'")
+    return normalized
+
+
+def normalize_export_config(raw_value: Any) -> tuple[bool, list[str]]:
+    if raw_value is None:
+        return True, list(DEFAULT_EXPORT_FORMATS)
+    if not isinstance(raw_value, dict):
+        raise SpecError("output.export must be an object")
+    enabled = bool(raw_value.get("enabled", True))
+    raw_formats = raw_value.get("formats", list(DEFAULT_EXPORT_FORMATS))
+    if isinstance(raw_formats, str):
+        formats = [raw_formats]
+    elif isinstance(raw_formats, list):
+        formats = raw_formats
+    else:
+        raise SpecError("output.export.formats must be a string or array of strings")
+    normalized: list[str] = []
+    for entry in formats:
+        if not isinstance(entry, str):
+            raise SpecError("output.export.formats must contain only strings")
+        value = entry.strip().casefold()
+        if value == "htm":
+            value = "html"
+        if value not in {"pdf", "html", "latex"}:
+            raise SpecError("output.export.formats entries must be pdf, html, or latex")
+        if value not in normalized:
+            normalized.append(value)
+    return enabled, normalized
+
+
+def probe_optional_dependency(import_name: str) -> dict[str, Any]:
+    try:
+        module = importlib.import_module(import_name)
+    except Exception as exc:
+        return {
+            "available": False,
+            "import_name": import_name,
+            "source": None,
+            "detail": str(exc),
+        }
+
+    module_path = getattr(module, "__file__", None)
+    source = "bundled"
+    if module_path:
+        resolved = str(Path(module_path).resolve())
+        if any(resolved.startswith(path) for path in VENDOR_PATHS):
+            source = "vendor"
+    return {
+        "available": True,
+        "import_name": import_name,
+        "source": source,
+        "detail": None,
+    }
+
+
+def detect_optional_dependencies() -> dict[str, dict[str, Any]]:
+    return {
+        "python_docx": probe_optional_dependency("docx"),
+        "markdown": probe_optional_dependency("markdown"),
+        "weasyprint": probe_optional_dependency("weasyprint"),
+    }
+
+
+def compute_output_capabilities(dependencies: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    template_path = PROJECT_ROOT / "assets" / "apa-template.docx"
+    markdown_available = dependencies["markdown"]["available"]
+    docx_available = dependencies["python_docx"]["available"] and template_path.exists()
+    pdf_available = dependencies["weasyprint"]["available"]
+    return {
+        "omv": {"available": True},
+        "markdown": {"available": True},
+        "docx": {
+            "available": docx_available,
+            "renderer": "python-docx" if docx_available else None,
+            "detail": None if docx_available else (
+                f"Template missing: {template_path}" if not template_path.exists() else dependencies["python_docx"]["detail"]
+            ),
+        },
+        "html": {
+            "available": True,
+            "renderer": "markdown" if markdown_available else "preformatted-fallback",
+            "detail": None if markdown_available else dependencies["markdown"]["detail"],
+        },
+        "latex": {
+            "available": True,
+            "renderer": "markdown" if markdown_available else "preformatted-fallback",
+            "detail": None if markdown_available else dependencies["markdown"]["detail"],
+        },
+        "pdf": {
+            "available": pdf_available,
+            "renderer": "weasyprint" if pdf_available else None,
+            "detail": None if pdf_available else dependencies["weasyprint"]["detail"],
+        },
+    }
+
+
+def resolve_default_export_formats(
+    export_formats: Sequence[str],
+    raw_export_config: Any,
+    output_capabilities: dict[str, dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    if raw_export_config is not None:
+        return list(export_formats), []
+
+    effective: list[str] = []
+    warnings: list[str] = []
+    for fmt in export_formats:
+        capability = output_capabilities.get(fmt, {"available": True})
+        if capability.get("available", True):
+            effective.append(fmt)
+            continue
+        warnings.append(
+            f"Default export format '{fmt}' disabled by preflight: {capability.get('detail') or 'dependency unavailable'}"
+        )
+    return effective, warnings
+
+
+def build_preflight_report() -> dict[str, Any]:
+    dependencies = detect_optional_dependencies()
+    output_capabilities = compute_output_capabilities(dependencies)
+    default_export_formats, warnings = resolve_default_export_formats(
+        DEFAULT_EXPORT_FORMATS,
+        None,
+        output_capabilities,
+    )
+    if not output_capabilities["docx"]["available"]:
+        warnings.append(f"DOCX output unavailable: {output_capabilities['docx']['detail']}")
+    if output_capabilities["html"]["renderer"] == "preformatted-fallback":
+        warnings.append("HTML and LaTeX exports will use the plain preformatted fallback because markdown is unavailable.")
+    return {
+        "status": "ok",
+        "jamovi_home": str(DEFAULT_JAMOVI_HOME),
+        "project_root": str(PROJECT_ROOT),
+        "vendor_paths": VENDOR_PATHS,
+        "dependencies": dependencies,
+        "outputs": output_capabilities,
+        "default_export_formats": default_export_formats,
+        "warnings": warnings,
+    }
+
+
 def normalize_analysis_spec(raw_spec: dict[str, Any]) -> dict[str, Any]:
     analysis_type = normalize_analysis_type(str(raw_spec.get("analysis_type", "")))
     variables = ensure_mapping(raw_spec.get("variables"), "variables")
@@ -275,6 +480,9 @@ def normalize_top_level_spec(raw_spec: Any) -> dict[str, Any]:
         if not contract["is_executable"]:
             raise ParseContractError(contract["missing_info"] or "Request is not executable")
         return contract["analysis_spec"]
+
+    if raw_spec.get("request_kind") == "preset" and "analyses" not in raw_spec:
+        return raw_spec
 
     top_measure_overrides = ensure_mapping(raw_spec.get("measure_overrides"), "measure_overrides")
     output_basename = raw_spec.get("output_basename")
@@ -338,7 +546,9 @@ def normalize_parse_contract(raw_contract: Any) -> dict[str, Any]:
 
 def read_dataset_headers(data_path: Path) -> list[str]:
     suffix = data_path.suffix.lower()
-    if suffix in {".csv", ".txt", ".tsv"}:
+    supported_text = {".csv", ".txt", ".tsv"}
+    supported_excel = {".xlsx", ".xlsm"}
+    if suffix in supported_text:
         delimiter = "\t" if suffix == ".tsv" else None
         with data_path.open("r", encoding="utf-8-sig", newline="") as handle:
             sample = handle.read(4096)
@@ -355,7 +565,7 @@ def read_dataset_headers(data_path: Path) -> list[str]:
                     return [cell.strip() for cell in row if cell.strip()]
         return []
 
-    if suffix in {".xlsx", ".xlsm"}:
+    if suffix in supported_excel:
         try:
             import openpyxl  # type: ignore
         except Exception:
@@ -365,8 +575,9 @@ def read_dataset_headers(data_path: Path) -> list[str]:
         first_row = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
         workbook.close()
         return [str(cell).strip() for cell in first_row if cell is not None and str(cell).strip()]
-
-    return []
+    raise RunnerError(
+        f"Unsupported data file type '{suffix}'. Supported formats: {', '.join(sorted(supported_text | supported_excel))}."
+    )
 
 
 def extract_column_mentions(text: str, columns: Sequence[str]) -> list[str]:
@@ -572,7 +783,7 @@ def build_column_map(data: Any) -> dict[str, Any]:
     return columns
 
 
-def normalize_variable_binding(value: Any, role: RoleSpec, role_name: str) -> str | list[str] | None:
+def normalize_variable_binding(value: Any, role: RoleSpec, role_name: str) -> str | list[str] | list[dict[str, str]] | None:
     if value is None:
         return None
 
@@ -584,6 +795,18 @@ def normalize_variable_binding(value: Any, role: RoleSpec, role_name: str) -> st
         if not isinstance(value, str) or not value.strip():
             raise SpecError(f"variables.{role_name} must be a column name")
         return value.strip()
+
+    if role_name == "pairs" and isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        normalized_pairs: list[dict[str, str]] = []
+        for item in value:
+            i1 = item.get("i1")
+            i2 = item.get("i2")
+            if not isinstance(i1, str) or not i1.strip() or not isinstance(i2, str) or not i2.strip():
+                raise SpecError("variables.pairs entries must contain non-empty 'i1' and 'i2' column names")
+            normalized_pairs.append({"i1": i1.strip(), "i2": i2.strip()})
+        if role.required and not normalized_pairs:
+            raise SpecError("variables.pairs requires at least one pair")
+        return normalized_pairs
 
     if isinstance(value, str):
         values = [value.strip()] if value.strip() else []
@@ -729,6 +952,26 @@ def prepare_analysis_payload(
             if role.required:
                 raise ValidationError(f"variables.{role_name} is required for {analysis_type}.")
             continue
+        if role_name == "pairs" and isinstance(normalized_value, list) and normalized_value and isinstance(normalized_value[0], dict):
+            normalized_pairs: list[dict[str, str]] = []
+            for pair in normalized_value:
+                i1 = pair.get("i1")
+                i2 = pair.get("i2")
+                if i1 is None or i2 is None:
+                    raise ValidationError("variables.pairs entries must contain i1 and i2.")
+                if i1 not in column_map or i2 not in column_map:
+                    missing = [name for name in (i1, i2) if name not in column_map]
+                    raise ValidationError(f"Unknown column(s) for role 'pairs': {', '.join(missing)}")
+                for name in (i1, i2):
+                    column = column_map[name]
+                    ensure_measure_requirements(column, role.measure)
+                    ensure_level_count(column, role_name, role)
+                normalized_pairs.append({"i1": i1, "i2": i2})
+            if role.required and not normalized_pairs:
+                raise ValidationError("variables.pairs requires at least one pair.")
+            normalized_variables[role_name] = normalized_pairs
+            continue
+
         names = [normalized_value] if isinstance(normalized_value, str) else normalized_value
         missing = [name for name in names if name not in column_map]
         if missing:
@@ -798,522 +1041,6 @@ async def poll_analysis(analysis: Any, session: Session, timeout_seconds: float,
             return "timeout", timeout_message
 
         await asyncio.sleep(poll_interval_seconds)
-
-
-def cell_value(cell: Any) -> Any:
-    fields = cell.ListFields()
-    if not fields:
-        return None
-    descriptor, value = fields[0]
-    if descriptor.name == "o":
-        return None
-    return value
-
-
-def clean_value(value: Any) -> Any:
-    if value in ("", ".", "—"):
-        return None
-    return value
-
-
-def table_rows(table: Any) -> list[dict[str, Any]]:
-    columns = list(table.columns)
-    row_count = max((len(column.cells) for column in columns), default=0)
-    rows: list[dict[str, Any]] = []
-    for row_index in range(row_count):
-        row: dict[str, Any] = {}
-        for column in columns:
-            row[column.name] = clean_value(cell_value(column.cells[row_index])) if row_index < len(column.cells) else None
-        rows.append(row)
-    return rows
-
-
-def walk_result_elements(node: Any) -> Iterable[Any]:
-    yield node
-    if node.HasField("group"):
-        for child in node.group.elements:
-            yield from walk_result_elements(child)
-    if node.HasField("array"):
-        for child in node.array.elements:
-            yield from walk_result_elements(child)
-
-
-def find_first_named_element(root: Any, name: str) -> Any | None:
-    for node in walk_result_elements(root):
-        if getattr(node, "name", "") == name:
-            return node
-    return None
-
-
-def find_all_named_elements(root: Any, name: str) -> list[Any]:
-    return [node for node in walk_result_elements(root) if getattr(node, "name", "") == name]
-
-
-def format_number(value: Any, *, digits: int = 4) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if abs(value) >= 1000:
-            return f"{value:.2f}"
-        if value.is_integer():
-            return str(int(value))
-        return f"{value:.{digits}f}".rstrip("0").rstrip(".")
-    return str(value)
-
-
-def format_p_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if value < 0.001:
-        return "< 0.001"
-    return format_number(value, digits=4)
-
-
-def markdown_table(rows: Sequence[dict[str, Any]]) -> list[str]:
-    if not rows:
-        return ["No extractable rows were available."]
-
-    columns = list(rows[0].keys())
-    lines = [
-        "| " + " | ".join(columns) + " |",
-        "| " + " | ".join("---" for _ in columns) + " |",
-    ]
-    for row in rows:
-        values = [str(row.get(column, "") or "") for column in columns]
-        lines.append("| " + " | ".join(values) + " |")
-    return lines
-
-
-def format_variables_for_markdown(variables: dict[str, Any]) -> str:
-    chunks: list[str] = []
-    for key, value in variables.items():
-        if isinstance(value, list):
-            chunks.append(f"{key}={', '.join(f'`{item}`' for item in value)}")
-        else:
-            chunks.append(f"{key}=`{value}`")
-    return "; ".join(chunks)
-
-
-def build_descriptives_sections(root: Any) -> list[dict[str, Any]]:
-    element = find_first_named_element(root, "descriptives")
-    if element is None or not element.HasField("table"):
-        return []
-
-    metrics: dict[str, dict[str, Any]] = {}
-    for column in element.table.columns:
-        match = re.match(r"(.+)\[([^\]]+)\]$", column.name)
-        if not match:
-            continue
-        variable_name, stat_name = match.groups()
-        if variable_name == "stat":
-            continue
-        metrics.setdefault(variable_name, {})[stat_name] = clean_value(cell_value(column.cells[0])) if column.cells else None
-
-    rows = []
-    for variable_name, stats in metrics.items():
-        rows.append(
-            {
-                "Variable": variable_name,
-                "N": format_number(stats.get("n")),
-                "Missing": format_number(stats.get("missing")),
-                "Mean": format_number(stats.get("mean")),
-                "Median": format_number(stats.get("median")),
-                "SD": format_number(stats.get("sd")),
-                "Min": format_number(stats.get("min")),
-                "Max": format_number(stats.get("max")),
-            }
-        )
-    return [{"title": "Key Results", "rows": rows}]
-
-
-def build_ttest_sections(root: Any) -> list[dict[str, Any]]:
-    element = find_first_named_element(root, "ttest")
-    if element is None or not element.HasField("table"):
-        return []
-
-    rows = []
-    for suffix in ("stud", "welc", "mann"):
-        values = {}
-        for key in ("var", "name", "stat", "df", "p", "es", "esType"):
-            column_name = f"{key}[{suffix}]"
-            for column in element.table.columns:
-                if column.name == column_name and column.cells:
-                    values[key] = clean_value(cell_value(column.cells[0]))
-                    break
-        if not values.get("name"):
-            continue
-        if values.get("stat") is None and values.get("p") is None:
-            continue
-        row = {
-            "Variable": values.get("var") or "",
-            "Test": values.get("name") or "",
-            "Statistic": format_number(values.get("stat")),
-            "df": format_number(values.get("df")),
-            "p": format_p_value(values.get("p")),
-        }
-        if values.get("es") is not None:
-            label = values.get("esType") or "Effect Size"
-            row[str(label)] = format_number(values.get("es"))
-        rows.append(row)
-
-    sections = [{"title": "Key Results", "rows": rows}] if rows else []
-    descriptives = find_first_named_element(root, "desc")
-    if descriptives is not None and descriptives.HasField("table"):
-        desc_rows = []
-        for row in table_rows(descriptives.table):
-            desc_rows.append(
-                {
-                    "Variable": row.get("dep") or "",
-                    "Group 1": row.get("group[1]") or "",
-                    "N 1": format_number(row.get("num[1]")),
-                    "Mean 1": format_number(row.get("mean[1]")),
-                    "SD 1": format_number(row.get("sd[1]")),
-                    "Group 2": row.get("group[2]") or "",
-                    "N 2": format_number(row.get("num[2]")),
-                    "Mean 2": format_number(row.get("mean[2]")),
-                    "SD 2": format_number(row.get("sd[2]")),
-                }
-            )
-        if desc_rows:
-            sections.append({"title": "Group Descriptives", "rows": desc_rows})
-    return sections
-
-
-def build_anova_sections(root: Any) -> list[dict[str, Any]]:
-    element = find_first_named_element(root, "anova")
-    if element is None or not element.HasField("table"):
-        return []
-
-    rows = []
-    for row in table_rows(element.table):
-        for suffix, label in (("welch", "Welch"), ("fisher", "Fisher")):
-            if row.get(f"p[{suffix}]") is None and row.get(f"F[{suffix}]") is None:
-                continue
-            rows.append(
-                {
-                    "Dependent Variable": row.get("dep") or "",
-                    "Test": label,
-                    "F": format_number(row.get(f"F[{suffix}]")),
-                    "df1": format_number(row.get(f"df1[{suffix}]")),
-                    "df2": format_number(row.get(f"df2[{suffix}]")),
-                    "p": format_p_value(row.get(f"p[{suffix}]")),
-                }
-            )
-    sections = [{"title": "Key Results", "rows": rows}] if rows else []
-
-    descriptives = find_first_named_element(root, "desc")
-    if descriptives is not None and descriptives.HasField("table"):
-        desc_rows = []
-        for row in table_rows(descriptives.table):
-            desc_rows.append(
-                {
-                    "Dependent Variable": row.get("dep") or "",
-                    "Group": row.get("group") or "",
-                    "N": format_number(row.get("num")),
-                    "Mean": format_number(row.get("mean")),
-                    "SD": format_number(row.get("sd")),
-                    "SE": format_number(row.get("se")),
-                }
-            )
-        if desc_rows:
-            sections.append({"title": "Group Descriptives", "rows": desc_rows})
-    return sections
-
-
-def build_corr_sections(root: Any) -> list[dict[str, Any]]:
-    element = find_first_named_element(root, "matrix")
-    if element is None or not element.HasField("table"):
-        return []
-
-    rows = table_rows(element.table)
-    pair_rows: list[dict[str, Any]] = []
-    for row in rows:
-        target = row.get(".name[r]")
-        if not target:
-            continue
-        for key, value in row.items():
-            match = re.match(r"(.+)\[r\]$", key)
-            if not match:
-                continue
-            other = match.group(1)
-            if other.startswith(".") or value is None:
-                continue
-            pair_rows.append(
-                {
-                    "Variable 1": other,
-                    "Variable 2": target,
-                    "r": format_number(value),
-                    "df": format_number(row.get(f"{other}[rdf]")),
-                    "p": format_p_value(row.get(f"{other}[rp]")),
-                    "N": format_number(row.get(f"{other}[n]")),
-                }
-            )
-    return [{"title": "Key Results", "rows": pair_rows[:12]}] if pair_rows else []
-
-
-def build_linreg_sections(root: Any) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
-
-    model_fit = find_first_named_element(root, "modelFit")
-    if model_fit is not None and model_fit.HasField("table"):
-        fit_rows = []
-        for row in table_rows(model_fit.table):
-            fit_rows.append(
-                {
-                    "Model": format_number(row.get("model")),
-                    "R": format_number(row.get("r")),
-                    "R2": format_number(row.get("r2")),
-                    "Adjusted R2": format_number(row.get("r2Adj")),
-                    "F": format_number(row.get("f")),
-                    "df1": format_number(row.get("df1")),
-                    "df2": format_number(row.get("df2")),
-                    "p": format_p_value(row.get("p")),
-                }
-            )
-        if fit_rows:
-            sections.append({"title": "Model Fit", "rows": fit_rows})
-
-    coefficient_tables = find_all_named_elements(root, "coef")
-    coefficient_rows: list[dict[str, Any]] = []
-    for table_element in coefficient_tables:
-        if not table_element.HasField("table"):
-            continue
-        for row in table_rows(table_element.table):
-            coefficient_rows.append(
-                {
-                    "Term": row.get("term") or "",
-                    "Estimate": format_number(row.get("est")),
-                    "SE": format_number(row.get("se")),
-                    "Lower": format_number(row.get("lower")),
-                    "Upper": format_number(row.get("upper")),
-                    "t": format_number(row.get("t")),
-                    "p": format_p_value(row.get("p")),
-                }
-            )
-    if coefficient_rows:
-        sections.append({"title": "Coefficients", "rows": coefficient_rows[:12]})
-    return sections
-
-
-def build_logreg_sections(root: Any) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
-
-    model_fit = find_first_named_element(root, "modelFit")
-    if model_fit is not None and model_fit.HasField("table"):
-        fit_rows = []
-        for row in table_rows(model_fit.table):
-            fit_rows.append(
-                {
-                    "Model": format_number(row.get("model")),
-                    "Deviance": format_number(row.get("dev")),
-                    "AIC": format_number(row.get("aic")),
-                    "McFadden R2": format_number(row.get("r2mf")),
-                    "Chi Square": format_number(row.get("chi")),
-                    "df": format_number(row.get("df")),
-                    "p": format_p_value(row.get("p")),
-                }
-            )
-        if fit_rows:
-            sections.append({"title": "Model Fit", "rows": fit_rows})
-
-    coefficient_tables = find_all_named_elements(root, "coef")
-    coefficient_rows: list[dict[str, Any]] = []
-    for table_element in coefficient_tables:
-        if not table_element.HasField("table"):
-            continue
-        for row in table_rows(table_element.table):
-            coefficient_rows.append(
-                {
-                    "Term": row.get("term") or "",
-                    "Estimate": format_number(row.get("est")),
-                    "SE": format_number(row.get("se")),
-                    "Lower": format_number(row.get("lower")),
-                    "Upper": format_number(row.get("upper")),
-                    "z": format_number(row.get("z")),
-                    "p": format_p_value(row.get("p")),
-                    "OR": format_number(row.get("odds")),
-                    "OR Lower": format_number(row.get("oddsLower")),
-                    "OR Upper": format_number(row.get("oddsUpper")),
-                }
-            )
-    if coefficient_rows:
-        sections.append({"title": "Coefficients", "rows": coefficient_rows[:12]})
-    return sections
-
-
-def build_cont_tables_sections(root: Any) -> list[dict[str, Any]]:
-    sections: list[dict[str, Any]] = []
-
-    chi_sq = find_first_named_element(root, "chiSq")
-    if chi_sq is not None and chi_sq.HasField("table"):
-        rows = []
-        for row in table_rows(chi_sq.table):
-            rows.append(
-                {
-                    "Test": row.get("test[chiSq]") or "Chi Square",
-                    "Value": format_number(row.get("value[chiSq]")),
-                    "df": format_number(row.get("df[chiSq]")),
-                    "p": format_p_value(row.get("p[chiSq]")),
-                    "N": format_number(row.get("value[N]")),
-                }
-            )
-        if rows:
-            sections.append({"title": "Chi Square Tests", "rows": rows})
-
-    nominal = find_first_named_element(root, "nom")
-    if nominal is not None and nominal.HasField("table"):
-        rows = []
-        for row in table_rows(nominal.table):
-            rows.append(
-                {
-                    "Contingency Coefficient": format_number(row.get("v[cont]")),
-                    "Phi": format_number(row.get("v[phi]")),
-                    "Cramers V": format_number(row.get("v[cra]")),
-                }
-            )
-        if rows:
-            sections.append({"title": "Nominal Measures", "rows": rows})
-    return sections
-
-
-def build_reliability_sections(root: Any) -> list[dict[str, Any]]:
-    element = find_first_named_element(root, "scale")
-    if element is None or not element.HasField("table"):
-        return []
-
-    rows = []
-    for row in table_rows(element.table):
-        rows.append(
-            {
-                "Scale": row.get("name") or "",
-                "Mean": format_number(row.get("mean")),
-                "SD": format_number(row.get("sd")),
-                "Cronbach Alpha": format_number(row.get("alpha")),
-                "McDonalds Omega": format_number(row.get("omega")),
-            }
-        )
-    return [{"title": "Scale Reliability", "rows": rows}]
-
-
-SUMMARY_BUILDERS = {
-    "anovaOneW": build_anova_sections,
-    "contTables": build_cont_tables_sections,
-    "corrMatrix": build_corr_sections,
-    "descriptives": build_descriptives_sections,
-    "linReg": build_linreg_sections,
-    "logRegBin": build_logreg_sections,
-    "reliability": build_reliability_sections,
-    "ttestIS": build_ttest_sections,
-}
-
-
-def build_summary_sections(analysis_type: str, root: Any) -> list[dict[str, Any]]:
-    builder = SUMMARY_BUILDERS.get(analysis_type)
-    if builder is None:
-        return []
-    return builder(root)
-
-
-def normalize_output_stem(raw_value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_value.strip())
-    cleaned = cleaned.strip("-.")
-    return cleaned or "jamovi-project"
-
-
-def resolve_output_paths(
-    data_path: Path,
-    output_dir: str | None,
-    output_basename: str | None,
-    spec_output_basename: str | None,
-) -> tuple[Path, Path]:
-    destination = Path(output_dir) if output_dir else data_path.parent
-    destination.mkdir(parents=True, exist_ok=True)
-    stem_source = output_basename or spec_output_basename or f"{data_path.stem}-jamovi-project"
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    stem = normalize_output_stem(stem_source)
-    return destination / f"{stem}-{timestamp}.omv", destination / f"{stem}-{timestamp}.md"
-
-
-def build_markdown_report(
-    data_path: Path,
-    omv_path: Path | None,
-    parse_contract: dict[str, Any] | None,
-    records: Sequence[AnalysisResultRecord],
-    teardown_errors: Sequence[str],
-    mode: str,
-) -> str:
-    lines = [
-        "# Jamovi Project Summary",
-        "",
-        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
-        f"- Mode: {mode}",
-        f"- Data file: `{data_path}`",
-        f"- OMV path: `{omv_path}`" if omv_path else "- OMV path: not saved",
-        "",
-    ]
-
-    if parse_contract is not None:
-        lines.extend(
-            [
-                "## Parse Contract",
-                "",
-                f"- is_executable: `{parse_contract['is_executable']}`",
-                f"- missing_info: {parse_contract['missing_info'] or 'n/a'}",
-                "",
-            ]
-        )
-
-    successful = [record for record in records if record.status == "success"]
-    failed = [record for record in records if record.status != "success"]
-
-    lines.extend(["## Successful Analyses", ""])
-    if not successful:
-        lines.append("No analyses completed successfully.")
-        lines.append("")
-    else:
-        for index, record in enumerate(successful, start=1):
-            lines.append(f"### {index}. {record.title} (`{record.analysis_type}`)")
-            lines.append("")
-            lines.append(f"- Variables: {format_variables_for_markdown(record.variables)}")
-            lines.append(f"- Status: {record.status_detail}")
-            if record.note:
-                lines.append(f"- Note: {record.note}")
-            lines.append("")
-            if record.summary_sections:
-                for section in record.summary_sections:
-                    lines.append(f"#### {section['title']}")
-                    lines.extend(markdown_table(section["rows"]))
-                    lines.append("")
-            else:
-                lines.append("Key results could not be extracted automatically. Open the `.omv` file for the full result tree.")
-                lines.append("")
-
-    lines.extend(["## Failed Analyses", ""])
-    if not failed:
-        lines.append("No analysis failures were recorded.")
-        lines.append("")
-    else:
-        failure_rows = [
-            {"Analysis": record.analysis_type, "Failure Type": record.status, "Reason": record.status_detail}
-            for record in failed
-        ]
-        lines.extend(markdown_table(failure_rows))
-        lines.append("")
-
-    lines.extend(["## Teardown", ""])
-    if teardown_errors:
-        for issue in teardown_errors:
-            lines.append(f"- {issue}")
-    else:
-        lines.append("- No teardown issues recorded.")
-    lines.append("")
-    return "\n".join(lines)
 
 
 async def execute_analyses(
@@ -1398,7 +1125,35 @@ async def execute_analyses(
 
 
 async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    data_path = Path(args.data_path).expanduser().resolve()
+    import time
+    start_time = time.time()
+    phase_timings: dict[str, float] = {}
+
+    job_spec = None
+    output_config: dict[str, Any] = {}
+    if args.job_file:
+        job_file_path = Path(args.job_file).expanduser().resolve()
+        job_spec = load_json_text(job_file_path.read_text(encoding="utf-8"), "--job-file")
+        data_path = Path(job_spec["data_path"]).expanduser().resolve()
+
+        # --- Wire JobFile.output -------------------------------------------------
+        job_output = job_spec.get("output") or {}
+        output_config = job_output
+        if job_output.get("dir") and not args.output_dir:
+            args.output_dir = job_output["dir"]
+        if job_output.get("basename") and not args.output_basename:
+            args.output_basename = job_output["basename"]
+
+        # --- Locale for Chinese .omv labels -------------------------------------
+        locale = job_spec.get("locale", "zh")
+        os.environ["LANGUAGE"] = locale
+
+        args.spec_json = json.dumps(job_spec)
+    else:
+        if not args.data_path:
+            raise RunnerError("Data path is required if job-file is not provided.")
+        data_path = Path(args.data_path).expanduser().resolve()
+
     if not data_path.exists():
         raise RunnerError(f"Data file not found: {data_path}")
 
@@ -1433,8 +1188,36 @@ async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], in
         spec = parse_inline_or_file_spec(args)
 
     assert spec is not None
+    if not output_config:
+        output_config = spec.get("output") or {}
+    table_style = normalize_table_style(output_config.get("table_style"))
+    raw_export_config = output_config.get("export")
+    export_enabled, export_formats = normalize_export_config(raw_export_config)
+    dependency_status = detect_optional_dependencies()
+    output_capabilities = compute_output_capabilities(dependency_status)
+    export_formats, preflight_warnings = resolve_default_export_formats(
+        export_formats,
+        raw_export_config,
+        output_capabilities,
+    )
 
-    omv_path, markdown_path = resolve_output_paths(
+    # --- Preprocess phase ---------------------------------------------------
+    column_manifest = None
+    sidecar_info: dict[str, Any] | None = None
+    t_pre = time.time()
+    if job_spec or spec.get("request_kind") == "preset" or spec.get("request_kind") == "structured":
+        try:
+            data_path, column_manifest, spec_raw, sidecar_info = preprocess_data(
+                data_path,
+                job_spec or spec,
+                args.output_dir,
+            )
+            spec = normalize_top_level_spec(spec_raw)
+        except Exception as exc:
+            raise RunnerError(f"Preprocess error: {exc}")
+    phase_timings["preprocess_seconds"] = time.time() - t_pre
+
+    omv_path, markdown_path, docx_path, output_base = resolve_output_paths(
         data_path=data_path,
         output_dir=args.output_dir,
         output_basename=args.output_basename,
@@ -1451,7 +1234,14 @@ async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], in
     try:
         await session.start()
         instance = await session.create("codex-project-instance")
+
+        # --- Open phase -----------------------------------------------------
+        t_open = time.time()
         await drain_progress_stream(instance.open(str(data_path)))
+        phase_timings["open_seconds"] = time.time() - t_open
+
+        # --- Run phase ------------------------------------------------------
+        t_run = time.time()
         records = await execute_analyses(
             session,
             instance,
@@ -1459,10 +1249,15 @@ async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], in
             analysis_timeout_seconds=args.analysis_timeout_seconds,
             poll_interval_seconds=max(args.poll_interval_ms / 1000.0, 0.05),
         )
+        phase_timings["run_seconds"] = time.time() - t_run
+
+        # --- Save phase -----------------------------------------------------
+        t_save = time.time()
         try:
             await drain_progress_stream(instance.save({"path": str(omv_path), "overwrite": True}))
         except Exception as exc:
             save_error = str(exc)
+        phase_timings["save_seconds"] = time.time() - t_save
     finally:
         try:
             await session._runner.stop()
@@ -1494,15 +1289,49 @@ async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], in
             )
         )
 
-    markdown_text = build_markdown_report(
+    phase_timings["total_seconds"] = time.time() - start_time
+    markdown_text = build_runner_markdown_report(
         data_path=data_path,
         omv_path=omv_path if omv_path.exists() else None,
         parse_contract=parse_contract,
         records=records,
         teardown_errors=teardown_errors,
         mode=mode,
+        column_manifest=column_manifest,
+        timings=phase_timings,
+        table_style=table_style,
+        sidecar_info=sidecar_info,
     )
-    markdown_path.write_text(markdown_text, encoding="utf-8")
+    try:
+        markdown_path.write_text(markdown_text, encoding="utf-8")
+    except Exception as exc:
+        teardown_errors.append(f"Failed to write markdown: {exc}")
+
+    output_warnings: list[str] = list(preflight_warnings)
+    template_path = PROJECT_ROOT / "assets" / "apa-template.docx"
+    docx_output, docx_warning = build_docx_report(
+        template_path=template_path,
+        output_path=docx_path,
+        data_path=data_path,
+        omv_path=omv_path if omv_path.exists() else None,
+        records=records,
+        mode=mode,
+        table_style=table_style,
+        column_manifest=column_manifest,
+        timings=phase_timings,
+    )
+    if docx_warning:
+        output_warnings.append(docx_warning)
+
+    export_paths: dict[str, str | None] = {}
+    export_warnings: list[str] = []
+    if export_enabled:
+        export_paths, export_warnings = await export_report_formats(
+            markdown_text,
+            output_base,
+            export_formats,
+        )
+        output_warnings.extend(export_warnings)
 
     success_count = sum(1 for record in records if record.status == "success")
     failure_count = sum(1 for record in records if record.status != "success")
@@ -1516,27 +1345,43 @@ async def run_project_mode(args: argparse.Namespace) -> tuple[dict[str, Any], in
 
     result = {
         "status": overall_status,
+        "timings": phase_timings,
         "mode": mode,
         "parse": parse_contract,
         "omv_path": str(omv_path) if omv_path.exists() else None,
         "markdown_path": str(markdown_path),
+        "docx_path": str(docx_output) if docx_output else None,
         "success_count": success_count,
         "failure_count": failure_count,
+        "output": {
+            "table_style": table_style,
+            "export": {
+                "enabled": export_enabled,
+                "formats": export_formats,
+                "paths": export_paths,
+                "warnings": export_warnings,
+            },
+        },
         "analyses": [
             {
                 "analysis_type": record.analysis_type,
                 "title": record.title,
                 "status": record.status,
                 "status_detail": record.status_detail,
+                "options": record.options,
             }
             for record in records
         ],
+        "output_warnings": output_warnings,
         "teardown_errors": teardown_errors,
     }
     return result, exit_code
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    if args.preflight:
+        print(json.dumps(build_preflight_report(), indent=2, ensure_ascii=False))
+        return 0
     result, exit_code = await run_project_mode(args)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return exit_code

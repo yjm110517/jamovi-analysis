@@ -1,5 +1,5 @@
 param(
-    [string]$JamoviHome = "C:\Program Files\jamovi 2.6.19.0",
+    [string]$JamoviHome = "",
     [string]$Code,
     [string]$File,
     [string[]]$Args
@@ -15,9 +15,8 @@ if (-not [string]::IsNullOrWhiteSpace($Code) -and -not [string]::IsNullOrWhiteSp
     throw "Use either -Code or -File, not both."
 }
 
-if (-not (Test-Path -LiteralPath $JamoviHome)) {
-    throw "JamoviHome not found: $JamoviHome"
-}
+$findJamoviHelper = Join-Path $PSScriptRoot "find-jamovi.ps1"
+$JamoviHome = & $findJamoviHelper -ProvidedPath $JamoviHome
 
 $rscript = Join-Path $JamoviHome "Frameworks\R\bin\x64\Rscript.exe"
 $jmvLib = Join-Path $JamoviHome "Resources\modules\jmv\R"

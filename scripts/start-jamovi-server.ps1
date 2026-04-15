@@ -1,5 +1,5 @@
 param(
-    [string]$JamoviHome = "C:\Program Files\jamovi 2.6.19.0",
+    [string]$JamoviHome = "",
     [int]$Port = 0,
     [switch]$ExposeAllInterfaces,
     [switch]$Debug,
@@ -8,9 +8,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not (Test-Path -LiteralPath $JamoviHome)) {
-    throw "JamoviHome not found: $JamoviHome"
-}
+$findJamoviHelper = Join-Path $PSScriptRoot "find-jamovi.ps1"
+$JamoviHome = & $findJamoviHelper -ProvidedPath $JamoviHome
 
 $python = Join-Path $JamoviHome "Frameworks\python\python.exe"
 $serverRoot = Join-Path $JamoviHome "Resources\server"

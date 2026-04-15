@@ -1,0 +1,21 @@
+{
+  "data_path": "examples/prepost_scale_study/data.csv",
+  "mode": "project",
+  "locale": "zh",
+  "request_kind": "preset",
+  "preset": {
+    "name": "prepost_scale_study",
+    "id_column": "user_id",
+    "group_column": "group",
+    "max_scale": 5,
+    "reverse_items": ["q03"],
+    "subscales": {
+      "creativity": ["q01", "q02", "q03"]
+    }
+  },
+  "output": {
+    "dir": "jamovi_outputs",
+    "basename": "prepost-example",
+    "table_style": "apa"
+  }
+}

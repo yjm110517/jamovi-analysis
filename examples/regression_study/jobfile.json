@@ -1,0 +1,20 @@
+{
+  "data_path": "examples/regression_study/data.csv",
+  "mode": "project",
+  "request_kind": "structured",
+  "analyses": [
+    {
+      "analysis_type": "linReg",
+      "variables": {
+        "dep": "y",
+        "covs": ["x1", "x2"],
+        "factors": ["gender"]
+      }
+    }
+  ],
+  "output": {
+    "dir": "jamovi_outputs",
+    "basename": "regression-example",
+    "table_style": "apa"
+  }
+}

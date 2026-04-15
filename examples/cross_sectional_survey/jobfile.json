@@ -1,0 +1,25 @@
+{
+  "data_path": "examples/cross_sectional_survey/data.csv",
+  "mode": "project",
+  "locale": "zh",
+  "request_kind": "structured",
+  "analyses": [
+    {
+      "analysis_type": "descriptives",
+      "variables": {
+        "vars": ["q01", "q02", "q03", "q04"]
+      }
+    },
+    {
+      "analysis_type": "corrMatrix",
+      "variables": {
+        "vars": ["q01", "q02", "q03", "q04"]
+      }
+    }
+  ],
+  "output": {
+    "dir": "jamovi_outputs",
+    "basename": "cross-sectional-example",
+    "table_style": "apa"
+  }
+}

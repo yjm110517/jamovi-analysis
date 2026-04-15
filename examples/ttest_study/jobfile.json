@@ -1,0 +1,26 @@
+{
+  "data_path": "examples/ttest_study/data.csv",
+  "mode": "project",
+  "request_kind": "structured",
+  "analyses": [
+    {
+      "analysis_type": "ttestIS",
+      "variables": {
+        "vars": ["score"],
+        "group": "group"
+      },
+      "options": {
+        "students": true,
+        "welchs": true,
+        "effectSize": true,
+        "ci": true,
+        "desc": true
+      }
+    }
+  ],
+  "output": {
+    "dir": "jamovi_outputs",
+    "basename": "ttest-example",
+    "table_style": "apa"
+  }
+}

@@ -1,38 +1,47 @@
 param(
-    [string]$JamoviHome = "C:\Program Files\jamovi 2.6.19.0",
+    [string]$JamoviHome = "",
     [string]$DataPath,
     [string]$SpecJson,
     [string]$SpecFile,
     [string]$Request,
+    [string]$RequestFile,
+    [string]$JobFile,
     [string]$OutputDir,
     [string]$OutputBasename,
+    [string]$Locale = "zh",
     [double]$AnalysisTimeoutSeconds = 120,
     [int]$PollIntervalMs = 250
 )
 
 $ErrorActionPreference = "Stop"
 
-if ([string]::IsNullOrWhiteSpace($DataPath)) {
-    throw "Provide -DataPath."
+if ([string]::IsNullOrWhiteSpace($DataPath) -and [string]::IsNullOrWhiteSpace($JobFile)) {
+    throw "Provide either -DataPath (legacy) or -JobFile."
 }
 
 $structured = -not [string]::IsNullOrWhiteSpace($SpecJson) -or -not [string]::IsNullOrWhiteSpace($SpecFile)
-$naturalLanguage = -not [string]::IsNullOrWhiteSpace($Request)
+$naturalLanguage = -not [string]::IsNullOrWhiteSpace($Request) -or -not [string]::IsNullOrWhiteSpace($RequestFile)
+$hasJob = -not [string]::IsNullOrWhiteSpace($JobFile)
 
-if ($structured -and $naturalLanguage) {
+if ($hasJob -and ($structured -or $naturalLanguage)) {
+    throw "Use either -JobFile OR legacy parameters (-SpecJson/-SpecFile/-Request), not both."
+}
+
+if (-not $hasJob -and $structured -and $naturalLanguage) {
     throw "Use either structured mode (-SpecJson/-SpecFile) or NL mode (-Request), not both."
 }
 
-if (-not $structured -and -not $naturalLanguage) {
-    throw "Provide -SpecJson/-SpecFile for structured mode, or -Request for NL mode."
+if (-not $hasJob -and -not $structured -and -not $naturalLanguage) {
+    throw "Provide -JobFile as the canonical config, or legacy -SpecJson/-SpecFile for structured mode, or -Request for NL mode."
 }
 
-if (-not (Test-Path -LiteralPath $JamoviHome)) {
-    throw "JamoviHome not found: $JamoviHome"
-}
+$findJamoviHelper = Join-Path $PSScriptRoot "find-jamovi.ps1"
+$JamoviHome = & $findJamoviHelper -ProvidedPath $JamoviHome
 
 $python = Join-Path $JamoviHome "Frameworks\python\python.exe"
 $runner = Join-Path $PSScriptRoot "run-jamovi-project.py"
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$vendorRoot = Join-Path $projectRoot "vendor\jamovi-python"
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Bundled Python not found: $python"
@@ -64,6 +73,13 @@ $env:JAMOVI_VERSION_PATH = Join-Path $JamoviHome "Resources\version"
 $env:R_HOME = Join-Path $JamoviHome "Frameworks\R"
 $env:R_LIBS = Join-Path $JamoviHome "Resources\modules\base\R"
 $env:JAMOVI_R_VERSION = "4.4.1-x64"
+$env:LANGUAGE = $Locale
+if (Test-Path -LiteralPath $vendorRoot) {
+    $env:JAMOVI_PROJECT_VENDOR_PATH = $vendorRoot
+}
+else {
+    Remove-Item -LiteralPath "Env:JAMOVI_PROJECT_VENDOR_PATH" -ErrorAction SilentlyContinue
+}
 
 $pathParts = @(
     (Join-Path $JamoviHome "Frameworks\python"),
@@ -78,10 +94,17 @@ $env:PATH = ($pathParts -join ";")
 $cmdArgs = @(
     "-Xutf8",
     $runner,
-    "--data-path", $DataPath,
     "--analysis-timeout-seconds", [string]$AnalysisTimeoutSeconds,
     "--poll-interval-ms", [string]$PollIntervalMs
 )
+
+if (-not [string]::IsNullOrWhiteSpace($DataPath)) {
+    $cmdArgs += @("--data-path", $DataPath)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($JobFile)) {
+    $cmdArgs += @("--job-file", $JobFile)
+}
 
 if (-not [string]::IsNullOrWhiteSpace($SpecJson)) {
     $cmdArgs += @("--spec-json", $SpecJson)
@@ -99,23 +122,26 @@ if (-not [string]::IsNullOrWhiteSpace($OutputBasename)) {
     $cmdArgs += @("--output-basename", $OutputBasename)
 }
 
-$requestFilePath = $null
+$tempRequestFilePath = $null
 $exitCode = 0
 
 try {
     if (-not [string]::IsNullOrWhiteSpace($Request)) {
-        $requestFilePath = Join-Path ([System.IO.Path]::GetTempPath()) ("jamovi-project-request-" + [System.Guid]::NewGuid().ToString("N") + ".txt")
+        $tempRequestFilePath = Join-Path ([System.IO.Path]::GetTempPath()) ("jamovi-project-request-" + [System.Guid]::NewGuid().ToString("N") + ".txt")
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($requestFilePath, $Request, $utf8NoBom)
-        $cmdArgs += @("--request-file", $requestFilePath)
+        [System.IO.File]::WriteAllText($tempRequestFilePath, $Request, $utf8NoBom)
+        $cmdArgs += @("--request-file", $tempRequestFilePath)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($RequestFile)) {
+        $cmdArgs += @("--request-file", $RequestFile)
     }
 
     & $python @cmdArgs
     $exitCode = $LASTEXITCODE
 }
 finally {
-    if ($requestFilePath -and (Test-Path -LiteralPath $requestFilePath)) {
-        Remove-Item -LiteralPath $requestFilePath -Force -ErrorAction SilentlyContinue
+    if ($tempRequestFilePath -and (Test-Path -LiteralPath $tempRequestFilePath)) {
+        Remove-Item -LiteralPath $tempRequestFilePath -Force -ErrorAction SilentlyContinue
     }
 }
 

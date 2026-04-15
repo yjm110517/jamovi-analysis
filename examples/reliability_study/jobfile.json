@@ -1,0 +1,18 @@
+{
+  "data_path": "examples/reliability_study/data.csv",
+  "mode": "project",
+  "request_kind": "structured",
+  "analyses": [
+    {
+      "analysis_type": "reliability",
+      "variables": {
+        "vars": ["q01", "q02", "q03", "q04", "q05"]
+      }
+    }
+  ],
+  "output": {
+    "dir": "jamovi_outputs",
+    "basename": "reliability-example",
+    "table_style": "apa"
+  }
+}
